@@ -1,0 +1,110 @@
+# Build/test every push and PR; publish matching version tags after all checks pass.
+# Action versions are pinned to commit SHAs.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v[0-9]*', '[0-9]*.[0-9]*.[0-9]*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate version and release tag
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: python3 .github/scripts/release.py version
+      - name: Test release packaging
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+
+  # The x86 build is for 32-bit applications running under WOW64 on 64-bit
+  # Windows, so the x64 runner runs its tests too.
+  test:
+    needs: metadata
+    name: test (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, i686-pc-windows-msvc]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt --target ${{ matrix.target }}
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+      - if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo fmt --all --check
+      - run: >-
+          cargo clippy --workspace --all-targets --target ${{ matrix.target }} --locked --
+          -D warnings -W raw_borrows_via_references -W clippy::borrow_as_ptr
+      - run: cargo test --workspace --target ${{ matrix.target }} --locked
+
+  # One archive carries both builds: x64/ the DLL and the tool, x86/ only the
+  # DLL for 32-bit applications (the tool is 64-bit only).
+  binaries:
+    needs: metadata
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc,i686-pc-windows-msvc
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release
+      - run: cargo build --release --workspace --target x86_64-pc-windows-msvc --locked
+      - run: cargo build --release -p kinect10 --target i686-pc-windows-msvc --locked
+      - name: Package binaries, symbols and documentation
+        run: python3 .github/scripts/release.py package
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [metadata, test, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      RUN_ID: ${{ github.run_id }}
+      PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download distribution archives
+        run: gh run download "$RUN_ID" --name release --dir artifacts
+      - name: Verify completeness and generate SHA-256 checksums
+        run: python3 .github/scripts/release.py collect
+      - name: Publish GitHub Release
+        shell: bash
+        run: |
+          flags=()
+          if [[ "$PRERELEASE" == true ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes \
+            --title "$RELEASE_TAG" "${flags[@]}"
