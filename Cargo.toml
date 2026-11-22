@@ -33,7 +33,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Threading",
 ] }
 # Raw ABI for the hook functions in the proxy DLL.
-windows-sys = { version = "0.61", features = [
+windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
