@@ -1,13 +1,14 @@
-# Build/test pushes to master and every PR; publish matching version tags after
-# all checks pass. Other branches are checked through their PR only, so a PR
-# branch (e.g. Renovate's) is not built twice. Action versions are pinned to
-# commit SHAs.
+# Build/test pushes to master and every PR; publish version tags (v + the Cargo
+# version) after all checks pass. Other branches are checked through their PR
+# only, so a PR branch (e.g. Renovate's) is not built twice. Action versions are
+# pinned to commit SHAs.
 name: CI
 
 on:
   push:
     branches: [master]
-    tags: ['v[0-9]*', '[0-9]*.[0-9]*.[0-9]*']
+    # vX.Y.Z and vX.Y.Z-<prerelease> (`+` repeats the preceding character)
+    tags: ['v[0-9]+.[0-9]+.[0-9]+', 'v[0-9]+.[0-9]+.[0-9]+-*']
   pull_request:
 
 permissions:

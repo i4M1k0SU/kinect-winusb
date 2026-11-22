@@ -44,11 +44,11 @@ class ReleaseTests(unittest.TestCase):
             return {name: bundle.read(name) for name in bundle.namelist()}
 
     def test_tag_matches_workspace_version(self):
-        for tag in ("v1.2.3", "1.2.3", ""):
+        for tag in ("v1.2.3", ""):
             self.assertFalse(release.validate_tag("1.2.3", tag))
         self.assertTrue(release.validate_tag("1.2.3-rc.1", "v1.2.3-rc.1"))
         self.assertFalse(release.validate_tag("1.2.3+build.4", "v1.2.3+build.4"))
-        for version, tag in (("1.2.3", "v1.2.4"), ("01.2.3", ""), ("1.2.3-01", "")):
+        for version, tag in (("1.2.3", "1.2.3"), ("1.2.3", "v1.2.4"), ("01.2.3", ""), ("1.2.3-01", "")):
             with self.subTest(version=version, tag=tag), self.assertRaises(ValueError):
                 release.validate_tag(version, tag)
 
