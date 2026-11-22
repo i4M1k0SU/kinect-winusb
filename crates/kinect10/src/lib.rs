@@ -14,7 +14,10 @@ use std::ffi::{CStr, c_void};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use windows_sys::Win32::Foundation::{E_NOTIMPL, HMODULE, TRUE};
-use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleFileNameW, GetModuleHandleExW,
+    GetProcAddress, LoadLibraryW,
+};
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows_sys::core::{BOOL, HRESULT};
 
@@ -202,8 +205,21 @@ extern "system" fn DllMain(module: HMODULE, reason: u32, _reserved: *mut c_void)
             log::error!(
                 "cannot load the official Kinect runtime {OFFICIAL} (install the Kinect for Windows Runtime); every function will fail"
             );
+        } else if h == module {
+            // This proxy was copied over the official DLL. Hooking and forwarding
+            // to itself would recurse forever, so fail every call instead.
+            log::error!(
+                "{OFFICIAL} is this proxy, not the official runtime (reinstall the Kinect for Windows Runtime); every function will fail"
+            );
         } else {
             log::info!("official runtime: {}", module_path(h));
+            // From here on the official DLL's imports and the stream threads
+            // run this module's code: never let FreeLibrary unmap it.
+            let mut pinned = std::ptr::null_mut();
+            let flags = GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS;
+            if unsafe { GetModuleHandleExW(flags, module.cast(), &raw mut pinned) } == 0 {
+                log::error!("cannot pin the proxy DLL: {}", std::io::Error::last_os_error());
+            }
             unsafe { hooks::install(h) };
             resolve(h);
         }
