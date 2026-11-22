@@ -1,0 +1,22 @@
+[package]
+name = "kinect10"
+description = "Drop-in Kinect10.dll: loads the official Kinect runtime and serves its camera I/O over WinUSB"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "kinect10"
+crate-type = ["cdylib"]
+
+[dependencies]
+kinect-usb.workspace = true
+windows-sys.workspace = true
+log.workspace = true
+pelite.workspace = true
+
+[build-dependencies]
+jiff.workspace = true
+winresource.workspace = true
