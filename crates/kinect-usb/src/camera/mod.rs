@@ -26,6 +26,7 @@ pub mod status {
     pub const NO_SUCH_DEVICE: NtStatus = 0xC000_000E_u32.cast_signed();
     pub const INVALID_DEVICE_REQUEST: NtStatus = 0xC000_0010_u32.cast_signed();
     pub const BUFFER_TOO_SMALL: NtStatus = 0xC000_0023_u32.cast_signed();
+    pub const INSUFFICIENT_RESOURCES: NtStatus = 0xC000_009A_u32.cast_signed();
     pub const OBJECT_NAME_NOT_FOUND: NtStatus = 0xC000_0034_u32.cast_signed();
     pub const DEVICE_BUSY: NtStatus = 0x8000_0011_u32.cast_signed();
     pub const CANCELLED: NtStatus = 0xC000_0120_u32.cast_signed();
@@ -43,6 +44,7 @@ pub mod status {
         match code {
             2 | 3 => OBJECT_NAME_NOT_FOUND,
             5 => ACCESS_DENIED,
+            8 | 14 | 1450 => INSUFFICIENT_RESOURCES,
             32 => SHARING_VIOLATION,
             87 => INVALID_PARAMETER,
             995 => CANCELLED,
@@ -114,6 +116,10 @@ pub struct CameraFile {
     /// Configured-pipe index (None = control handle).
     pipe: Option<u8>,
     id: u64,
+    /// Set by `cleanup`. A read holds it while being queued, so none can be
+    /// queued behind the cancellation, e.g. by a `ReadFile` that raced
+    /// `CloseHandle` on the same handle.
+    closed: Mutex<bool>,
 }
 
 impl CameraFile {
@@ -123,11 +129,20 @@ impl CameraFile {
 
     pub fn read(&self, mut req: ReadRequest) {
         req.file_id = self.id;
+        let closed = self.closed.lock().unwrap();
+        if *closed {
+            drop(closed);
+            req.complete(status::CANCELLED, 0);
+            return;
+        }
         self.cam.read(self.pipe, req);
     }
 
-    /// IRP_MJ_CLEANUP: cancel this file's queued reads.
+    /// IRP_MJ_CLEANUP: cancel this file's queued reads and refuse new ones.
     pub fn cleanup(&self) {
+        if let Some(mut closed) = lock_unless_exiting(&self.closed) {
+            *closed = true;
+        }
         self.cam.cancel_file(self.id);
     }
 
@@ -182,7 +197,7 @@ pub fn open(base_path: &str, suffix: &str) -> Result<CameraFile, NtStatus> {
     {
         return Err(status::INVALID_DEVICE_REQUEST);
     }
-    Ok(CameraFile { cam, pipe, id: NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed) })
+    Ok(CameraFile { cam, pipe, id: NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed), closed: Mutex::new(false) })
 }
 
 /// IOCTL codes (`CTL_CODE(0x22, fn, METHOD_BUFFERED, FILE_ANY_ACCESS)`).

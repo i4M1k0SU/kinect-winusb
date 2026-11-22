@@ -209,7 +209,12 @@ impl Camera {
         self.streams[0].state.lock().unwrap().pending_count = 0;
         self.run(table);
         let expected = self.color_expected(mode);
-        self.streams[0].start(&self.usb, &self.pstats, expected);
+        let st = self.streams[0].start(&self.usb, &self.pstats, expected);
+        if st < 0 {
+            // The camera is already sending: switch it off again.
+            self.run(tables::COLOR_OFF);
+            return st;
+        }
         self.color_streaming.store(1, Ordering::Relaxed);
         info!("color stream started (mode {mode}, frame {expected} B)");
         status::SUCCESS
@@ -217,7 +222,7 @@ impl Camera {
 
     fn stop_color(&self) -> NtStatus {
         self.run(tables::COLOR_OFF);
-        self.streams[0].stop(&self.usb);
+        self.streams[0].stop();
         self.color_streaming.store(0, Ordering::Relaxed);
         info!("color stream stopped");
         status::SUCCESS
@@ -226,7 +231,11 @@ impl Camera {
     fn start_depth(&self) -> NtStatus {
         self.streams[1].state.lock().unwrap().pending_count = 0;
         self.run(tables::DEPTH_ON);
-        self.streams[1].start(&self.usb, &self.pstats, DEPTH_FRAME);
+        let st = self.streams[1].start(&self.usb, &self.pstats, DEPTH_FRAME);
+        if st < 0 {
+            self.run(tables::DEPTH_OFF);
+            return st;
+        }
         self.depth_streaming.store(1, Ordering::Relaxed);
         info!("depth stream started");
         status::SUCCESS
@@ -234,7 +243,7 @@ impl Camera {
 
     fn stop_depth(&self) -> NtStatus {
         self.run(tables::DEPTH_OFF);
-        self.streams[1].stop(&self.usb);
+        self.streams[1].stop();
         self.depth_streaming.store(0, Ordering::Relaxed);
         info!("depth stream stopped");
         status::SUCCESS
@@ -429,8 +438,8 @@ impl Camera {
         let _q = lock_unless_exiting(&self.queue);
         let st = match code {
             RESET_DEVICE => {
-                self.streams[1].stop(&self.usb);
-                self.streams[0].stop(&self.usb);
+                self.streams[1].stop();
+                self.streams[0].stop();
                 self.run(tables::INIT);
                 status::SUCCESS
             }
@@ -527,7 +536,7 @@ impl Drop for Camera {
     fn drop(&mut self) {
         info!("closing camera {}", self.path);
         for s in &self.streams {
-            s.stop_reader(&self.usb);
+            s.stop_reader();
         }
     }
 }
