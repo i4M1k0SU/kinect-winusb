@@ -1,0 +1,12 @@
+[package]
+name = "kinect-usb"
+description = "User-mode (WinUSB) re-implementation of the Kinect v1 camera driver (kinectcamera.sys)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+windows.workspace = true
+log.workspace = true
