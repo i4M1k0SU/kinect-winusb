@@ -1,0 +1,21 @@
+[package]
+name = "kinect-tool"
+description = "Diagnostics and WinUSB setup for the Kinect v1 WinUSB compatibility runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "kinect-winusb"
+path = "src/main.rs"
+
+[dependencies]
+kinect-usb.workspace = true
+windows.workspace = true
+log.workspace = true
+
+[build-dependencies]
+jiff.workspace = true
+winresource.workspace = true
