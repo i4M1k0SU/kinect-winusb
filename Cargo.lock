@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "kinect-tool"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "jiff",
  "kinect-usb",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "kinect-usb"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "log",
  "windows",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "kinect10"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "jiff",
  "kinect-usb",
