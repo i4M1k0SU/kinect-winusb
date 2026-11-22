@@ -335,7 +335,8 @@ impl Camera {
         let addr = usize::from_le_bytes(*input[ptr_off..ptr_off + PS].as_array().unwrap());
         let ptr = std::ptr::with_exposed_provenance::<u16>(addr);
         let n = read_u32(input, n_off) as usize;
-        if 2 * n > 0x1F8 || (ptr.is_null() && n > 1) {
+        // The driver's `2 * n > 0x1F8`, without overflowing a 32-bit usize.
+        if n > 0x1F8 / 2 || (ptr.is_null() && n > 1) {
             return status::INVALID_PARAMETER;
         }
         let payload = Vec::from_fn(n >> 1, |i| unsafe { ptr.add(i).read_unaligned() });
