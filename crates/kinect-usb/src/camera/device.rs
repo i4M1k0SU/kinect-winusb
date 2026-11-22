@@ -210,7 +210,7 @@ impl Camera {
         self.streams[0].state.lock().unwrap().pending_count = 0;
         self.run(table);
         let expected = self.color_expected(mode);
-        let st = self.streams[0].start(&self.usb, &self.pstats, expected);
+        let st = self.streams[0].start(&self.usb, &self.pstats, expected, &self.streams);
         if st < 0 {
             // The camera is already sending: switch it off again.
             self.run(tables::COLOR_OFF);
@@ -232,7 +232,7 @@ impl Camera {
     fn start_depth(&self) -> NtStatus {
         self.streams[1].state.lock().unwrap().pending_count = 0;
         self.run(tables::DEPTH_ON);
-        let st = self.streams[1].start(&self.usb, &self.pstats, DEPTH_FRAME);
+        let st = self.streams[1].start(&self.usb, &self.pstats, DEPTH_FRAME, &self.streams);
         if st < 0 {
             self.run(tables::DEPTH_OFF);
             return st;

@@ -39,6 +39,15 @@ fn complete_all(done: &mut Finished) {
     }
 }
 
+/// Whether the device is gone. A failed transfer does not tell: on removal the
+/// queued ones fail with ERROR_GEN_FAILURE or ERROR_OPERATION_ABORTED and the
+/// next ones with ERROR_BUSY, as they can while the device is attached. A
+/// standard GET_STATUS fails with "no such device" errors only once it is gone.
+fn device_removed(usb: &WinUsbDevice) -> bool {
+    let mut st = [0u8; 2];
+    usb.control(0x80, 0x00, 0, 0, &mut st).is_err_and(|e| status::from_error(&e) == status::NO_SUCH_DEVICE)
+}
+
 /// QPC time in microseconds (`sub_17EE8`).
 pub fn now_us() -> i64 {
     let mut c = 0i64;
@@ -264,7 +273,15 @@ impl Stream {
 
     /// `start_data_path` (`sub_14F20`). If the reader thread cannot start or
     /// set up its transfers, the stream is stopped again and the error returned.
-    pub fn start(self: &Arc<Self>, usb: &Arc<WinUsbDevice>, pstats: &Arc<PacketStats>, expected: usize) -> NtStatus {
+    /// `all` is every stream of the device: the reader stops them all when the
+    /// device is removed.
+    pub fn start(
+        self: &Arc<Self>,
+        usb: &Arc<WinUsbDevice>,
+        pstats: &Arc<PacketStats>,
+        expected: usize,
+        all: &[Arc<Stream>; 2],
+    ) -> NtStatus {
         {
             let mut st = self.state.lock().unwrap();
             st.stats = [0; 7];
@@ -273,15 +290,19 @@ impl Stream {
         }
         *pstats.lock().unwrap() = [0; 13];
         let mut reader = self.reader.lock().unwrap();
+        // A reader that ended by itself (the device was removed) is replaced.
+        if let Some(r) = reader.take_if(|r| r.thread.is_finished()) {
+            let _ = r.thread.join();
+        }
         if reader.is_some() {
             return status::SUCCESS;
         }
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready) = mpsc::sync_channel(1);
-        let (s, u, p, st) = (self.clone(), usb.clone(), pstats.clone(), stop.clone());
+        let (s, u, p, st, all) = (self.clone(), usb.clone(), pstats.clone(), stop.clone(), all.clone());
         let spawned = std::thread::Builder::new()
             .name(format!("kinect-iso-{:02x}", self.endpoint))
-            .spawn(move || s.run(&u, &p, &st, &ready_tx));
+            .spawn(move || s.run(&u, &p, &st, &ready_tx, &all));
         let failure = match spawned {
             Err(e) => {
                 error!("cannot start the isoch reader for ep 0x{:02x}: {e}", self.endpoint);
@@ -354,13 +375,15 @@ impl Stream {
 
     /// Reader thread: keep `XFERS` isochronous transfers queued and feed every
     /// received packet to the parser, in order. `ready` gets the outcome of
-    /// the setup before anything is queued.
+    /// the setup before anything is queued. Once the device is removed, the
+    /// thread stops `all` streams and ends.
     fn run(
         &self,
         usb: &WinUsbDevice,
         pstats: &PacketStats,
         stop: &AtomicBool,
         ready: &SyncSender<Result<(), NtStatus>>,
+        all: &[Arc<Stream>; 2],
     ) {
         const PACKETS: u32 = 32;
         const XFERS: usize = 24;
@@ -431,7 +454,15 @@ impl Stream {
         info!("isoch reader ep 0x{:02x} started ({} x {} packets of {} B)", self.endpoint, XFERS, PACKETS, per);
         let mut errors = 0u32;
         let mut done = Finished::new();
+        let mut retry = false;
+        let mut removed = false;
         'outer: while !stop.load(Ordering::Acquire) {
+            // Every round but the first follows a failure.
+            if retry && device_removed(usb) {
+                removed = true;
+                break;
+            }
+            retry = true;
             // (Re)start the stream: queue every slot, the first without ContinueStream.
             let mut ok = true;
             for (i, slot) in slots.iter_mut().enumerate() {
@@ -496,6 +527,14 @@ impl Stream {
                     continue 'outer;
                 }
                 i = (i + 1) % XFERS;
+            }
+        }
+        if removed {
+            // The driver's surprise removal: stop both data paths, which fails
+            // their reads, instead of waiting until the handles are closed.
+            info!("camera removed (ep 0x{:02x}): stopping its streams", self.endpoint);
+            for s in all {
+                s.flush();
             }
         }
         // Wait for everything still queued before the buffer goes away.
