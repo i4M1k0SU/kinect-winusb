@@ -15,7 +15,7 @@ log = "0.4"
 pelite = { version = "0.10", default-features = false, features = ["std"] }
 # Build scripts: the VERSIONINFO resource (build/windows.rs) and its copyright year.
 winresource = "0.1.34"
-jiff = { version = "0.2.42", default-features = false, features = ["std"] }
+jiff = { version = "0.2.45", default-features = false, features = ["std"] }
 windows = { version = "0.62", features = [
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Devices_Properties",
