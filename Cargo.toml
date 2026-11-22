@@ -11,7 +11,7 @@ repository = "https://github.com/i4M1k0SU/kinect-winusb"
 
 [workspace.dependencies]
 kinect-usb = { path = "crates/kinect-usb" }
-log = "0.4"
+log = "0.4.35"
 pelite = { version = "0.10", default-features = false, features = ["std"] }
 # Build scripts: the VERSIONINFO resource (build/windows.rs) and its copyright year.
 winresource = "0.1.34"
