@@ -32,8 +32,8 @@ def validate_tag(version, tag):
     prerelease = version.split("+", 1)[0].partition("-")[2]
     if any(part.isdigit() and len(part) > 1 and part.startswith("0") for part in prerelease.split(".")):
         raise ValueError(f"Invalid prerelease: {version}")
-    if tag and tag not in (version, f"v{version}"):
-        raise ValueError(f"Tag {tag!r} must match Cargo version {version!r} (optional v prefix)")
+    if tag and tag != f"v{version}":
+        raise ValueError(f"Tag {tag!r} must be v + Cargo version {version!r}")
     return bool(prerelease)
 
 

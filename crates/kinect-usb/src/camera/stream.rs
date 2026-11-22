@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -15,7 +16,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::Owned;
 
-use super::{ReadRequest, lock_unless_exiting, status};
+use super::{NtStatus, ReadRequest, status};
+use crate::lock_unless_exiting;
 use crate::winusb::WinUsbDevice;
 use log::{debug, error, info};
 
@@ -25,6 +27,26 @@ pub const HEADER_LEN: usize = 32;
 
 /// Packet error statistics shared by both streams (IOCTL 0x220010, 13 u32).
 pub type PacketStats = Mutex<[u32; 13]>;
+
+/// Reads finished while the stream locks were held, to be completed after they
+/// are released: a completion can drop the last reference to the camera, which
+/// stops both readers (see `Stream::stop_reader`).
+type Finished = Vec<(ReadRequest, NtStatus, usize)>;
+
+fn complete_all(done: &mut Finished) {
+    for (req, status, info) in done.drain(..) {
+        req.complete(status, info);
+    }
+}
+
+/// Whether the device is gone. A failed transfer does not tell: on removal the
+/// queued ones fail with ERROR_GEN_FAILURE or ERROR_OPERATION_ABORTED and the
+/// next ones with ERROR_BUSY, as they can while the device is attached. A
+/// standard GET_STATUS fails with "no such device" errors only once it is gone.
+fn device_removed(usb: &WinUsbDevice) -> bool {
+    let mut st = [0u8; 2];
+    usb.control(0x80, 0x00, 0, 0, &mut st).is_err_and(|e| status::from_error(&e) == status::NO_SUCH_DEVICE)
+}
 
 /// QPC time in microseconds (`sub_17EE8`).
 pub fn now_us() -> i64 {
@@ -141,16 +163,16 @@ impl Stream {
     }
 
     /// `sub_121C8`: abort the read being filled.
-    fn abort_current(st: &mut StreamState) {
+    fn abort_current(st: &mut StreamState, done: &mut Finished) {
         if let Some(c) = st.current.take() {
             st.stats[2] += 1;
             st.pending_count = st.pending_count.wrapping_sub(1);
-            c.req.complete(status::REQUEST_ABORTED, 0);
+            done.push((c.req, status::REQUEST_ABORTED, 0));
         }
     }
 
     /// Process one isochronous packet (`sub_13CF4`).
-    fn parse_packet(&self, st: &mut StreamState, pkt: &[u8], pstats: &mut [u32; 13]) {
+    fn parse_packet(&self, st: &mut StreamState, pkt: &[u8], pstats: &mut [u32; 13], done: &mut Finished) {
         let s = self.index;
         if pkt.len() < 12 {
             pstats[2] += 1;
@@ -204,13 +226,13 @@ impl Stream {
                         None => st.stats[3] += 1,
                     }
                 }
-                Self::append(st, payload);
+                Self::append(st, payload, done);
             }
-            1 => Self::append(st, payload),
+            1 => Self::append(st, payload, done),
             _ => {
                 st.t_end = self.now();
                 if st.current.is_some() {
-                    Self::append(st, payload);
+                    Self::append(st, payload, done);
                 }
                 if let Some(mut cur) = st.current.take() {
                     let mut hdr = [0u8; HEADER_LEN];
@@ -222,8 +244,7 @@ impl Stream {
                     if cur.info == st.expected {
                         st.stats[1] += 1;
                         st.pending_count = st.pending_count.wrapping_sub(1);
-                        let n = st.expected;
-                        cur.req.complete(status::SUCCESS, n);
+                        done.push((cur.req, status::SUCCESS, st.expected));
                     } else {
                         pstats[8 + s] += 1;
                         cur.info = 0;
@@ -235,13 +256,13 @@ impl Stream {
     }
 
     /// `sub_138E4`: append payload behind the header area.
-    fn append(st: &mut StreamState, payload: &[u8]) {
+    fn append(st: &mut StreamState, payload: &[u8], done: &mut Finished) {
         let Some(cur) = st.current.as_mut() else {
             return;
         };
         let off = HEADER_LEN + cur.info;
         if off + payload.len() > cur.req.buf.len {
-            Self::abort_current(st);
+            Self::abort_current(st, done);
             return;
         }
         unsafe {
@@ -250,8 +271,17 @@ impl Stream {
         cur.info += payload.len();
     }
 
-    /// `start_data_path` (`sub_14F20`).
-    pub fn start(self: &Arc<Self>, usb: &Arc<WinUsbDevice>, pstats: &Arc<PacketStats>, expected: usize) {
+    /// `start_data_path` (`sub_14F20`). If the reader thread cannot start or
+    /// set up its transfers, the stream is stopped again and the error returned.
+    /// `all` is every stream of the device: the reader stops them all when the
+    /// device is removed.
+    pub fn start(
+        self: &Arc<Self>,
+        usb: &Arc<WinUsbDevice>,
+        pstats: &Arc<PacketStats>,
+        expected: usize,
+        all: &[Arc<Stream>; 2],
+    ) -> NtStatus {
         {
             let mut st = self.state.lock().unwrap();
             st.stats = [0; 7];
@@ -260,20 +290,49 @@ impl Stream {
         }
         *pstats.lock().unwrap() = [0; 13];
         let mut reader = self.reader.lock().unwrap();
+        // A reader that ended by itself (the device was removed) is replaced.
+        if let Some(r) = reader.take_if(|r| r.thread.is_finished()) {
+            let _ = r.thread.join();
+        }
         if reader.is_some() {
-            return;
+            return status::SUCCESS;
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let (s, u, p, st) = (self.clone(), usb.clone(), pstats.clone(), stop.clone());
-        let thread = std::thread::Builder::new()
+        let (ready_tx, ready) = mpsc::sync_channel(1);
+        let (s, u, p, st, all) = (self.clone(), usb.clone(), pstats.clone(), stop.clone(), all.clone());
+        let spawned = std::thread::Builder::new()
             .name(format!("kinect-iso-{:02x}", self.endpoint))
-            .spawn(move || s.run(&u, &p, &st))
-            .expect("spawn isoch reader");
-        *reader = Some(Reader { stop, thread });
+            .spawn(move || s.run(&u, &p, &st, &ready_tx, &all));
+        let failure = match spawned {
+            Err(e) => {
+                error!("cannot start the isoch reader for ep 0x{:02x}: {e}", self.endpoint);
+                status::INSUFFICIENT_RESOURCES
+            }
+            // No answer means the reader died before it was set up.
+            Ok(thread) => match ready.recv().unwrap_or(Err(status::UNSUCCESSFUL)) {
+                Ok(()) => {
+                    *reader = Some(Reader { stop, thread });
+                    return status::SUCCESS;
+                }
+                Err(st) => {
+                    let _ = thread.join();
+                    st
+                }
+            },
+        };
+        drop(reader);
+        self.flush();
+        failure
     }
 
     /// `stop_data_path` (`sub_14E40`).
-    pub fn stop(&self, usb: &WinUsbDevice) {
+    pub fn stop(&self) {
+        self.flush();
+        self.stop_reader();
+    }
+
+    /// Refuse new reads and fail the waiting ones and the one being filled.
+    fn flush(&self) {
         let Some(mut st) = lock_unless_exiting(&self.state) else {
             return;
         };
@@ -291,10 +350,9 @@ impl Stream {
         if let Some(c) = current {
             c.req.complete(status::REQUEST_ABORTED, 0);
         }
-        self.stop_reader(usb);
     }
 
-    pub fn stop_reader(&self, usb: &WinUsbDevice) {
+    pub fn stop_reader(&self) {
         // During process exit the reader thread is already gone: joining it would panic.
         if crate::process_exiting() {
             return;
@@ -306,14 +364,27 @@ impl Stream {
             // The reader stops requeueing and lets in-flight transfers finish
             // (at most XFERS * PACKETS microframes, ~100 ms).
             r.stop.store(true, Ordering::Release);
-            let _ = usb;
-            let _ = r.thread.join();
+            // A read completion on the reader thread can drop the last reference
+            // to the camera, whose drop stops the readers. A thread cannot join
+            // itself; this one sees `stop` and exits once its completions return.
+            if r.thread.thread().id() != std::thread::current().id() {
+                let _ = r.thread.join();
+            }
         }
     }
 
     /// Reader thread: keep `XFERS` isochronous transfers queued and feed every
-    /// received packet to the parser, in order.
-    fn run(&self, usb: &WinUsbDevice, pstats: &PacketStats, stop: &AtomicBool) {
+    /// received packet to the parser, in order. `ready` gets the outcome of
+    /// the setup before anything is queued. Once the device is removed, the
+    /// thread stops `all` streams and ends.
+    fn run(
+        &self,
+        usb: &WinUsbDevice,
+        pstats: &PacketStats,
+        stop: &AtomicBool,
+        ready: &SyncSender<Result<(), NtStatus>>,
+        all: &[Arc<Stream>; 2],
+    ) {
         const PACKETS: u32 = 32;
         const XFERS: usize = 24;
 
@@ -327,6 +398,24 @@ impl Stream {
         let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
         let per = self.bytes_per_interval;
         let xfer_len = per * PACKETS;
+        let fail = |what: &str, e: &windows::core::Error| {
+            error!("{what} for ep 0x{:02x} failed: {e}", self.endpoint);
+            let _ = ready.send(Err(status::from_error(e)));
+        };
+        let slots = (0..XFERS)
+            .map(|_| {
+                windows::core::Result::Ok(Slot {
+                    ov: Box::default(),
+                    event: unsafe { Owned::new(CreateEventW(None, true, false, None)?) },
+                    descs: vec![USBD_ISO_PACKET_DESCRIPTOR::default(); PACKETS as usize],
+                    queued: false,
+                })
+            })
+            .collect();
+        let mut slots: Vec<Slot> = match slots {
+            Ok(s) => s,
+            Err(e) => return fail("CreateEvent", &e),
+        };
         let mut buffer = vec![0u8; xfer_len as usize * XFERS];
         // Only raw pointers into the buffer are used: the device writes into the
         // regions of queued transfers concurrently.
@@ -336,17 +425,9 @@ impl Stream {
         }
         let iso = match unsafe { usb.register_isoch_buffer(self.endpoint, buf_ptr, buffer.len()) } {
             Ok(b) => b,
-            Err(e) => {
-                error!("WinUsb_RegisterIsochBuffer(ep 0x{:02x}) failed: {e}", self.endpoint);
-                return;
-            }
+            Err(e) => return fail("WinUsb_RegisterIsochBuffer", &e),
         };
-        let mut slots = Vec::from_fn(XFERS, |_| Slot {
-            ov: Box::default(),
-            event: unsafe { Owned::new(CreateEventW(None, true, false, None).expect("event")) },
-            descs: vec![USBD_ISO_PACKET_DESCRIPTOR::default(); PACKETS as usize],
-            queued: false,
-        });
+        let _ = ready.send(Ok(()));
         let submit = |slot: &mut Slot, i: usize, cont: bool| -> bool {
             *slot.ov = OVERLAPPED { hEvent: *slot.event, ..Default::default() };
             let r = unsafe { iso.read_asap(i as u32 * xfer_len, xfer_len, cont, &mut slot.descs, &raw const *slot.ov) };
@@ -372,7 +453,16 @@ impl Stream {
 
         info!("isoch reader ep 0x{:02x} started ({} x {} packets of {} B)", self.endpoint, XFERS, PACKETS, per);
         let mut errors = 0u32;
+        let mut done = Finished::new();
+        let mut retry = false;
+        let mut removed = false;
         'outer: while !stop.load(Ordering::Acquire) {
+            // Every round but the first follows a failure.
+            if retry && device_removed(usb) {
+                removed = true;
+                break;
+            }
+            retry = true;
             // (Re)start the stream: queue every slot, the first without ContinueStream.
             let mut ok = true;
             for (i, slot) in slots.iter_mut().enumerate() {
@@ -398,28 +488,32 @@ impl Stream {
                     Ok(_) => {
                         errors = 0;
                         self.transfers_done.fetch_add(1, Ordering::Relaxed);
-                        let mut st = self.state.lock().unwrap();
-                        let mut ps = pstats.lock().unwrap();
-                        let base = i * xfer_len as usize;
-                        for d in &slots[i].descs {
-                            if d.Status >= 0 || d.Status == USBD_DATA_UNDERRUN {
-                                if d.Length == 0 {
-                                    st.zero_length = st.zero_length.wrapping_add(1);
-                                } else {
-                                    let off = (d.Offset as usize).min(xfer_len as usize);
-                                    let len = (d.Length as usize).min(xfer_len as usize - off);
-                                    let pkt = unsafe { std::slice::from_raw_parts(buf_ptr.add(base + off), len) };
-                                    self.parse_packet(&mut st, pkt, &mut ps);
+                        {
+                            let mut st = self.state.lock().unwrap();
+                            let mut ps = pstats.lock().unwrap();
+                            let base = i * xfer_len as usize;
+                            for d in &slots[i].descs {
+                                if d.Status >= 0 || d.Status == USBD_DATA_UNDERRUN {
+                                    if d.Length == 0 {
+                                        st.zero_length = st.zero_length.wrapping_add(1);
+                                    } else {
+                                        let off = (d.Offset as usize).min(xfer_len as usize);
+                                        let len = (d.Length as usize).min(xfer_len as usize - off);
+                                        let pkt = unsafe { std::slice::from_raw_parts(buf_ptr.add(base + off), len) };
+                                        self.parse_packet(&mut st, pkt, &mut ps, &mut done);
+                                    }
                                 }
                             }
                         }
+                        complete_all(&mut done);
                     }
                     Err(e) => {
                         errors += 1;
                         if errors <= 3 || errors.is_multiple_of(100) {
                             error!("isoch transfer on ep 0x{:02x} failed: {e} (#{errors})", self.endpoint);
                         }
-                        Self::abort_current(&mut self.state.lock().unwrap());
+                        Self::abort_current(&mut self.state.lock().unwrap(), &mut done);
+                        complete_all(&mut done);
                         drain(&mut slots);
                         if errors > 20 {
                             std::thread::sleep(Duration::from_millis(100));
@@ -433,6 +527,14 @@ impl Stream {
                     continue 'outer;
                 }
                 i = (i + 1) % XFERS;
+            }
+        }
+        if removed {
+            // The driver's surprise removal: stop both data paths, which fails
+            // their reads, instead of waiting until the handles are closed.
+            info!("camera removed (ep 0x{:02x}): stopping its streams", self.endpoint);
+            for s in all {
+                s.flush();
             }
         }
         // Wait for everything still queued before the buffer goes away.
@@ -502,8 +604,14 @@ mod tests {
             ));
         }
         fn feed(&mut self, p: &[u8]) {
-            let mut st = self.stream.state.lock().unwrap();
-            self.stream.parse_packet(&mut st, p, &mut self.pstats);
+            let mut done = Finished::new();
+            {
+                let mut st = self.stream.state.lock().unwrap();
+                self.stream.parse_packet(&mut st, p, &mut self.pstats, &mut done);
+                // Completions wait until the lock is released.
+                assert!(self.rx.try_recv().is_err());
+            }
+            complete_all(&mut done);
         }
     }
 
@@ -587,19 +695,31 @@ mod tests {
 
     #[test]
     fn stop_cancels_waiting_reads_and_rejects_new_ones() {
-        let h = Harness::new(40);
-        h.read(64);
-        {
-            let mut st = h.stream.state.lock().unwrap();
-            st.accepting = false;
-            let w: Vec<ReadRequest> = st.pending.drain(..).collect();
-            drop(st);
-            for r in w {
-                r.complete(status::CANCELLED, 0);
-            }
-        }
-        assert_eq!(h.rx.try_recv().unwrap().0, status::CANCELLED);
+        let mut h = Harness::new(32 + 100);
+        h.read(256);
+        h.read(256);
+        h.feed(&pkt(SOF, &[1])); // the first read is being filled
+        h.stream.stop();
+        assert_eq!(h.rx.try_recv().unwrap().0, status::CANCELLED, "waiting read");
+        assert_eq!(h.rx.try_recv().unwrap().0, status::REQUEST_ABORTED, "read being filled");
         h.read(64);
         assert_eq!(h.rx.try_recv().unwrap().0, status::WDF_BUSY);
+    }
+
+    #[test]
+    fn reader_thread_can_stop_itself() {
+        // The last camera reference dropped by a completion on the reader thread.
+        let stream = Arc::new(Stream::new(1, 0x82, 1920, 40));
+        let (go, wait) = mpsc::channel::<()>();
+        let (finished, result) = mpsc::channel();
+        let s = stream.clone();
+        let thread = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            s.stop_reader();
+            finished.send(()).unwrap();
+        });
+        *stream.reader.lock().unwrap() = Some(Reader { stop: Arc::new(AtomicBool::new(false)), thread });
+        go.send(()).unwrap();
+        result.recv_timeout(Duration::from_secs(10)).expect("stop_reader must not join its own thread");
     }
 }

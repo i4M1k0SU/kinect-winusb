@@ -83,8 +83,17 @@ pub fn run(args: &[String]) -> i32 {
     let table: Vec<u16> = out[..n].as_chunks().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
     println!("depth table: [600]={} [800]={} [1000]={}", table[600], table[800], table[1000]);
 
-    let color = camera::open(&path, "\\PIPE00").expect("open color pipe");
-    let depth = camera::open(&path, "\\PIPE01").expect("open depth pipe");
+    let open_pipe = |suffix: &str| {
+        camera::open(&path, suffix)
+            .inspect_err(|st| eprintln!("open of {suffix} failed: 0x{:08X}", st.cast_unsigned()))
+            .ok()
+    };
+    let Some(color) = open_pipe("\\PIPE00") else {
+        return 1;
+    };
+    let Some(depth) = open_pipe("\\PIPE01") else {
+        return 1;
+    };
     let (tx, rx) = mpsc::channel();
     for r in 0..restarts {
         let (st, _) = ctl.ioctl(ioctl::START_DEPTH, &[], &mut []);

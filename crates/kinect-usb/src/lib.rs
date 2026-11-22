@@ -7,6 +7,7 @@
 //! `Kinect10.dll` can redirect the official runtime to it.
 
 use std::fmt;
+use std::sync::{Mutex, MutexGuard};
 
 pub mod camera;
 pub mod logger;
@@ -23,6 +24,15 @@ unsafe extern "system" {
 /// may have held any lock, and threads can no longer be joined.
 pub fn process_exiting() -> bool {
     RtlDllShutdownInProgress() != 0
+}
+
+/// Lock `m` for a stop or cleanup. The official runtime still stops its streams
+/// and closes its handles from `DLL_PROCESS_DETACH` when the application exits
+/// without `NuiShutdown`; by then `ExitProcess` has terminated every other
+/// thread, possibly one that held `m`. So during process exit this gives `None`
+/// instead of waiting forever.
+pub fn lock_unless_exiting<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    if process_exiting() { m.try_lock().ok() } else { Some(m.lock().unwrap()) }
 }
 
 /// Display bytes as space-separated hex (for logs).

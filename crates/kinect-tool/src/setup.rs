@@ -6,7 +6,9 @@
 //! test signing or self-signed certificates. Requires administrator rights.
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::*;
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, HWND};
+use windows::Win32::Foundation::{
+    E_ACCESSDENIED, ERROR_FILE_NOT_FOUND, ERROR_NO_ASSOCIATED_SERVICE, ERROR_NO_MORE_ITEMS, HWND,
+};
 use windows::Win32::System::Registry::{REG_MULTI_SZ, RegCloseKey, RegDeleteValueW, RegSetValueExW};
 use windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
 use windows::core::{BOOL, Error, HSTRING, PCWSTR, Result, w};
@@ -158,8 +160,7 @@ impl Device {
 
 fn report(what: &str, e: &Error) {
     eprintln!("  {what}: {e}");
-    // E_ACCESSDENIED, or SetupAPI's "no associated service".
-    if matches!(e.code().0.cast_unsigned(), 0x8007_0005 | 0xE000_0228) {
+    if [E_ACCESSDENIED, ERROR_NO_ASSOCIATED_SERVICE.to_hresult()].contains(&e.code()) {
         eprintln!("  (run this command from an elevated / administrator prompt)");
     }
 }
@@ -174,13 +175,13 @@ fn install_one(c: &devices::UsbDeviceNode) -> Result<()> {
     println!("  DeviceInterfaceGUIDs = {}", guid_string(&GUID_KINECT_CAMERA));
     if is_winusb(c) {
         println!("  WinUSB already bound; restarting the device");
-        if let Err(e) = dev.restart() {
-            eprintln!("  restart failed: {e} (unplug and replug the Kinect)");
-        }
     } else {
         let reboot = dev.install_inbox_winusb().inspect_err(|e| report("WinUSB installation failed", e))?;
         println!("  WinUSB installed{}", if reboot { " (reboot required)" } else { "" });
-        let _ = dev.restart();
+    }
+    // WinUSB reads DeviceInterfaceGUIDs when the device starts.
+    if let Err(e) = dev.restart() {
+        eprintln!("  restart failed: {e} (unplug and replug the Kinect)");
     }
     Ok(())
 }
