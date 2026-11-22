@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use kinect_usb::camera::{self, CameraFile, NtStatus, ReadRequest, UserBuffer};
+use kinect_usb::{lock_unless_exiting, process_exiting};
 use log::{debug, error, info, trace};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
@@ -39,17 +40,32 @@ struct EmuFile {
 unsafe impl Send for EmuFile {}
 unsafe impl Sync for EmuFile {}
 
+type Table = HashMap<usize, Arc<EmuFile>>;
+
 /// Emulated files by handle value.
-static TABLE: LazyLock<RwLock<HashMap<usize, Arc<EmuFile>>>> = LazyLock::new(Default::default);
+static TABLE: LazyLock<RwLock<Table>> = LazyLock::new(Default::default);
 
 /// Number of emulated handles currently open (fast path check).
 static OPEN_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// When the application exits without `NuiShutdown`, the official runtime stops
+// its streams and closes its handles from `DLL_PROCESS_DETACH`, after every
+// other thread was terminated, possibly one holding the table lock. So during
+// process exit the lock is only tried: a handle that cannot be looked up goes
+// to kernel32, which fails the call on the event object behind it.
+fn read_table() -> Option<RwLockReadGuard<'static, Table>> {
+    if process_exiting() { TABLE.try_read().ok() } else { TABLE.read().ok() }
+}
+
+fn write_table() -> Option<RwLockWriteGuard<'static, Table>> {
+    if process_exiting() { TABLE.try_write().ok() } else { TABLE.write().ok() }
+}
 
 fn lookup(h: HANDLE) -> Option<Arc<EmuFile>> {
     if OPEN_COUNT.load(Ordering::Acquire) == 0 {
         return None;
     }
-    TABLE.read().ok()?.get(&h.addr()).cloned()
+    read_table()?.get(&h.addr()).cloned()
 }
 
 pub unsafe fn install(module: HMODULE) {
@@ -105,7 +121,9 @@ unsafe fn complete_overlapped(ef: &EmuFile, ov: *mut OVERLAPPED, status: NtStatu
         let event = hevent.map_addr(|a| a & !1);
         SetEvent(if event.is_null() { ef.handle } else { event });
         if queue && hevent.addr() & 1 == 0 {
-            let iocp = *ef.iocp.lock().unwrap();
+            // During process exit the packet may be lost (see `read_table`), but
+            // then nothing reads the port anymore.
+            let iocp = lock_unless_exiting(&ef.iocp).and_then(|g| *g);
             if let Some((port, key)) = iocp {
                 match *NT_SET_IO_COMPLETION {
                     Some(f) => {
@@ -317,7 +335,7 @@ unsafe extern "system" fn hook_close_handle(h: HANDLE) -> BOOL {
     // Kinect10.dll closes many unrelated handles (events, threads): only take
     // the write lock for handles that are actually ours.
     if lookup(h).is_some()
-        && let Some(ef) = TABLE.write().ok().and_then(|mut t| t.remove(&h.addr()))
+        && let Some(ef) = write_table().and_then(|mut t| t.remove(&h.addr()))
     {
         OPEN_COUNT.fetch_sub(1, Ordering::AcqRel);
         info!("emulated close handle {:p}", h);

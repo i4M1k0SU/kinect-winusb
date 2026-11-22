@@ -8,7 +8,8 @@ use windows::Win32::Devices::Usb::{PIPE_TRANSFER_TIMEOUT, UsbdPipeTypeIsochronou
 use super::ioctl::*;
 use super::protocol::{CommandChannel, DATA, DeviceParams, run_table, tables};
 use super::stream::{PacketStats, Stream};
-use super::{NtStatus, ReadRequest, lock_unless_exiting, status};
+use super::{NtStatus, ReadRequest, status};
+use crate::lock_unless_exiting;
 use crate::winusb::{PipeInfo, WinUsbDevice};
 use log::{debug, error, info};
 

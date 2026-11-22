@@ -10,8 +10,9 @@ mod stream;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
+use crate::lock_unless_exiting;
 pub use device::Camera;
 pub use stream::now_us;
 
@@ -52,14 +53,6 @@ pub mod status {
             _ => IO_DEVICE_ERROR,
         }
     }
-}
-
-/// Lock `m` for a stop or cleanup. The official runtime still stops its streams
-/// from `DLL_PROCESS_DETACH` when the application exits without `NuiShutdown`;
-/// by then `ExitProcess` has terminated every other thread, possibly one that
-/// held `m`. So during process exit this gives `None` instead of waiting forever.
-fn lock_unless_exiting<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
-    if crate::process_exiting() { m.try_lock().ok() } else { Some(m.lock().unwrap()) }
 }
 
 /// Caller-owned buffer of an asynchronous read. The caller guarantees it stays

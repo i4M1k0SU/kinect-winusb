@@ -16,7 +16,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::Owned;
 
-use super::{NtStatus, ReadRequest, lock_unless_exiting, status};
+use super::{NtStatus, ReadRequest, status};
+use crate::lock_unless_exiting;
 use crate::winusb::WinUsbDevice;
 use log::{debug, error, info};
 
