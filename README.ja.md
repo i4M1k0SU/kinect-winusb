@@ -23,9 +23,8 @@ Kinect v1 (Kinect for Xbox 360 / Kinect for Windows) を、**コア分離のメ�
 ## 使い方
 
 1. Kinect のドライバを変更する
-   - Zadig やデバイスマネージャー上から WinUSB ドライバに変更する
-   - `kinect-winusb install` コマンドでも変更できる (管理者権限が必要)
-1. アプリ・ゲームの実行ファイルと同じフォルダに、実行ファイルのビット数に合った `kinect10.dll` をコピーする
+   - `kinect-winusb install` を実行 (管理者権限が必要)
+1. アプリ・ゲームの実行ファイルと同じフォルダに、実行ファイルと同じアーキテクチャの `kinect10.dll` をコピーする
 
 ### 既にメモリ整合性を無効化して Kinect v1 を使用している場合
 

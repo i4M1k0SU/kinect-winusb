@@ -23,9 +23,8 @@ The target is **64-bit Windows 10 / 11**. Memory integrity exists only there; ea
 ## Usage
 
 1. Change the Kinect's driver
-   - Switch it to the WinUSB driver with Zadig or Device Manager
-   - The `kinect-winusb install` command also does it (requires administrator rights)
-1. Copy the `kinect10.dll` that matches the executable's bitness into the same folder as the app's or game's executable
+   - Run `kinect-winusb install` (requires administrator rights)
+1. Copy the `kinect10.dll` built for the same architecture as the executable into the same folder as the app's or game's executable
 
 ### If you already use Kinect v1 with Memory integrity turned off
 
